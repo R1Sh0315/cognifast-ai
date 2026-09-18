@@ -6,8 +6,13 @@
 import { Server, Socket } from 'socket.io';
 import { streamChatGraphWithWebSocket } from '../services/chat-stream.service';
 import { createLogger } from '../utils/logger';
+import {
+    createChatMessageRateLimiter,
+    validateChatMessage
+} from '../utils/chat-message-validation';
 
 const logger = createLogger('CHAT-SOCKET');
+const chatMessageRateLimiter = createChatMessageRateLimiter();
 
 /**
  * Setup chat WebSocket handlers
@@ -44,12 +49,24 @@ export function setupChatSocket(io: Server): void {
          * Send message and stream response
          * Client emits: { conversationId: string, message: string }
          */
-        socket.on('send_message', async (data: { conversationId: string; message: string }) => {
+        socket.on('send_message', async (data: { conversationId?: string; message?: unknown } = {}) => {
             try {
                 const { conversationId, message } = data;
 
-                if (!conversationId || !message) {
+                if (!conversationId) {
                     socket.emit('error', { message: 'conversationId and message are required' });
+                    return;
+                }
+
+                const validatedMessage = validateChatMessage(message);
+                if (!validatedMessage.valid) {
+                    socket.emit('error', { conversationId, message: validatedMessage.error });
+                    return;
+                }
+
+                const rateLimit = chatMessageRateLimiter.check(`${socket.handshake.address}:${conversationId}`);
+                if (!rateLimit.allowed) {
+                    socket.emit('error', { conversationId, message: rateLimit.error });
                     return;
                 }
 
@@ -59,7 +76,7 @@ export function setupChatSocket(io: Server): void {
                 socket.emit('message_start', { conversationId });
 
                 // Stream the chat graph execution
-                await streamChatGraphWithWebSocket(conversationId, message, socket);
+                await streamChatGraphWithWebSocket(conversationId, validatedMessage.message, socket);
 
             } catch (error) {
                 logger.error(`[CHAT-SOCKET] Error processing message: ${error}`);

@@ -12,8 +12,13 @@ import {
     UpdateConversationResponse
 } from '../types/chat.types';
 import { createLogger } from '../utils/logger';
+import {
+    createChatMessageRateLimiter,
+    validateChatMessage
+} from '../utils/chat-message-validation';
 
 const logger = createLogger('CHAT-CONTROLLER');
+const chatMessageRateLimiter = createChatMessageRateLimiter();
 
 export class ChatController {
     /**
@@ -35,9 +40,21 @@ export class ChatController {
 
             logger.info(`Starting new conversation for ${sourceIds.length} source(s): ${sourceIds.join(', ')}${title ? ` with title: "${title}"` : ''}`);
 
+            const sanitizedInitialMessage = initialMessage === undefined
+                ? undefined
+                : validateChatMessage(initialMessage);
+
+            if (sanitizedInitialMessage && !sanitizedInitialMessage.valid) {
+                res.status(400).json({
+                    success: false,
+                    error: sanitizedInitialMessage.error
+                } as StartConversationResponse);
+                return;
+            }
+
             const { conversation, initialMessages } = await ChatService.createConversation({
                 sourceIds,
-                initialMessage,
+                initialMessage: sanitizedInitialMessage?.message,
                 title
             });
 
@@ -74,20 +91,30 @@ export class ChatController {
                 return;
             }
 
-            if (!message || message.trim() === '') {
+            const validatedMessage = validateChatMessage(message);
+            if (!validatedMessage.valid) {
                 res.status(400).json({
                     success: false,
-                    error: 'Message is required'
+                    error: validatedMessage.error
+                } as SendMessageResponse);
+                return;
+            }
+
+            const rateLimit = chatMessageRateLimiter.check(`${req.ip}:${conversationId}`);
+            if (!rateLimit.allowed) {
+                res.status(429).json({
+                    success: false,
+                    error: rateLimit.error
                 } as SendMessageResponse);
                 return;
             }
 
             logger.info(`Sending message to conversation: ${conversationId}`);
-            logger.info(`Message: ${message}`);
+            logger.info(`Message length: ${validatedMessage.message.length}`);
 
             const request: SendMessageRequest = {
                 conversationId,
-                message: message.trim()
+                message: validatedMessage.message
             };
 
             const result = await ChatService.sendMessage(request);
